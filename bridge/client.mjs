@@ -4,6 +4,7 @@ import { report, failures } from './diagnostics.mjs';
 import https from 'node:https';
 import { WebSocket } from 'ws';
 import { createTunnelStream } from './tunnel-stream.mjs';
+import { RelayAgent, STICKY_FAMILY_DEFAULT } from './tls-resume.mjs';
 import { Budget, meter } from './budget.mjs';
 import { target } from './policy.mjs';
 import { SessionQueue } from './session-queue.mjs';
@@ -46,11 +47,13 @@ export function retryDelayMs(failure, attempt, retryMs, remainingMs, random = Ma
 
 export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), ports = new Set([80, 443]),
   proxyEnv = process.env, openTimeoutMs = 10_000, attempts = 12, retryMs = 1000, connectWindowMs = 90_000, maxSessions = 24, maxQueued = 32, queueWaitMs = 20_000,
-  idleEvictMs = 90_000, halfCloseIdleMs = HALF_CLOSE_IDLE_MS, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
+  idleEvictMs = 90_000, halfCloseIdleMs = HALF_CLOSE_IDLE_MS, stickyFamily = STICKY_FAMILY_DEFAULT, relayLookup, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
   endpoint = validateEndpoint(endpoint);
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('Secret must have at least 32 characters');
   // Reuse authenticated HTTPS control sockets for readiness and cancellation.
-  const agent = new https.Agent({ proxyEnv, keepAlive: true, maxSockets: 32, maxFreeSockets: 4 });
+  // Shared agent: TLS sessions are resumed across WSS tunnels; the relay's
+  // working address family is tried first so fallback never drops tickets.
+  const agent = new RelayAgent({ stickyFamily, ...(relayLookup ? { lookup: relayLookup } : {}), proxyEnv, keepAlive: true, maxSockets: 32, maxFreeSockets: 4 });
   if (!Number.isFinite(idleEvictMs) || idleEvictMs < 0) throw new Error('Invalid idle eviction threshold');
   if (!Number.isFinite(halfCloseIdleMs) || halfCloseIdleMs < 0) throw new Error('Invalid half-close idle threshold');
   const queue = new SessionQueue({limit:maxSessions,maxPending:maxQueued,waitMs:queueWaitMs});
@@ -319,7 +322,7 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
   server.on('clientError', (_err, socket) => socket.destroy());
   server.headersTimeout = 15_000; server.requestTimeout = 160_000;
   return { server, budget,
-    checkRelay,
+    checkRelay, tlsStats: () => ({ ...agent.tlsStats }),
     async listen(port = 0) { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); }); return server.address().port; },
     async close() {
       stopped=true;queue.close();activity.clear();for(const probe of probes)probe.destroy();
