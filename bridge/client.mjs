@@ -292,9 +292,17 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
         res.writeHead(response.statusCode, clean);
         const counted = meter(bytes => consume(bytes + 64), () => touch(remote.ws));
         counted.on('error', () => { response.destroy(); res.destroy(); endTunnel(remote.ws); });
+        // A truncated origin response must reach the browser as an error,
+        // never hang or look complete.
+        response.once('close', () => { if (!response.complete) { res.destroy(); endTunnel(remote.ws); } });
+        response.on('error', () => {});
         response.pipe(counted).pipe(res);
       });
-      upstream.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end('Tunnel unavailable'); endTunnel(remote.ws); });
+      upstream.on('error', () => {
+        endTunnel(remote.ws);
+        if (res.headersSent) { res.destroy(); return; } // never append text to a started body
+        res.writeHead(502); res.end('Tunnel unavailable');
+      });
       const counted = meter(bytes => consume(bytes + 64), () => touch(remote.ws));
       counted.on('error', () => upstream.destroy());
       req.on('aborted', () => upstream.destroy());
