@@ -23,9 +23,9 @@ MAX_MEMBERS = 2000
 RUNTIME_PREFIX = 'dist/win-unpacked/'
 DEFAULT_ENDPOINT = 'wss://private-cloud-proxy-free.onrender.com/tunnel'
 DOWNLOAD_URL = 'https://drive.usercontent.google.com/download?id=1wyliCDJwMdz_3_dGLeECAFM91-fii4IB&export=download'
-BRIDGE_FILES = ('.env.example', 'Start-Private-Proxy.cmd', 'package.json', 'package-lock.json', 'README.md',
+BRIDGE_FILES = ('.env.example', 'LICENSE', 'Start-Private-Proxy.cmd', 'package.json', 'package-lock.json', 'README.md',
                 'bridge/README.md', 'bridge/env.mjs', 'bridge/start.mjs', 'bridge/bootstrap.mjs', 'bridge/client.mjs',
-                'bridge/fast-open.mjs', 'bridge/session-queue.mjs', 'bridge/diagnostics.mjs',
+                'bridge/tunnel-stream.mjs', 'bridge/lock.mjs', 'bridge/fast-open.mjs', 'bridge/session-queue.mjs', 'bridge/diagnostics.mjs',
                 'bridge/budget.mjs', 'bridge/policy.mjs', 'bridge/data/iana-special.json',
                 'bridge/check-remote.mjs', 'docs/WINDOWS-STARTUP.md', 'docs/PERFORMANCE.md',
                 'docs/USER-CHROME-WINDOWS.md')

@@ -16,7 +16,7 @@ if args.endpoint:
 root=Path(__file__).resolve().parents[1]
 target=args.output or root/'.local/private-cloud-proxy-free-windows.zip'
 target.parent.mkdir(parents=True, exist_ok=True)
-files=[root/p for p in ('.env.example','Start-Private-Proxy.cmd','package.json','package-lock.json','README.md','bridge/README.md','bridge/env.mjs','bridge/start.mjs','bridge/bootstrap.mjs','bridge/client.mjs','bridge/fast-open.mjs','bridge/session-queue.mjs','bridge/diagnostics.mjs','bridge/budget.mjs','bridge/policy.mjs','bridge/data/iana-special.json','bridge/check-remote.mjs','docs/WINDOWS-STARTUP.md','docs/PERFORMANCE.md')]
+files=[root/p for p in ('.env.example','LICENSE','Start-Private-Proxy.cmd','package.json','package-lock.json','README.md','bridge/README.md','bridge/env.mjs','bridge/start.mjs','bridge/bootstrap.mjs','bridge/client.mjs','bridge/tunnel-stream.mjs','bridge/lock.mjs','bridge/fast-open.mjs','bridge/session-queue.mjs','bridge/diagnostics.mjs','bridge/budget.mjs','bridge/policy.mjs','bridge/data/iana-special.json','bridge/check-remote.mjs','docs/WINDOWS-STARTUP.md','docs/PERFORMANCE.md')]
 for package in ('ws','ipaddr.js'):
     directory=root/'node_modules'/package
     if not directory.is_dir(): raise SystemExit('Run npm ci --ignore-scripts before packaging')
