@@ -1,5 +1,10 @@
 @echo off
 setlocal
+rem Repositorio: usa o Chrome Protegido do codigo-fonte (npm ci em user-chrome).
+if not defined PCP_PROTECTED_BROWSER_EXE if exist "%~dp0user-chrome\node_modules\electron\dist\electron.exe" (
+  set "PCP_PROTECTED_BROWSER_EXE=%~dp0user-chrome\node_modules\electron\dist\electron.exe"
+  set "PCP_PROTECTED_BROWSER_APP=%~dp0user-chrome"
+)
 cd /d "%~dp0"
 set "BRIDGE_DIR=%~dp0"
 set "BRIDGE_NODE=%~dp0.runtime\node-v24.22.1-win-x64\node.exe"

@@ -14,8 +14,8 @@ import { loadProjectEnv } from './env.mjs';
 export const DEFAULT_RELAY_TIMEOUTS = Object.freeze({ idleMs: 120_000, lifetimeMs: 1_800_000 });
 
 export function createRelay({ secret, server = http.createServer(), resolve = createCachedPublicResolver(), connect = connectPinned,
-  ports = new Set([80, 443]), maxSessions = 32, maxBytes = 16 * 1024 * 1024,
-  processBytes = 128 * 1024 * 1024, idleMs = DEFAULT_RELAY_TIMEOUTS.idleMs, lifetimeMs = DEFAULT_RELAY_TIMEOUTS.lifetimeMs,
+  ports = new Set([80, 443]), maxSessions = 32, maxBytes = 1024 * 1024 * 1024,
+  processBytes = 4 * 1024 * 1024 * 1024, idleMs = DEFAULT_RELAY_TIMEOUTS.idleMs, lifetimeMs = DEFAULT_RELAY_TIMEOUTS.lifetimeMs,
   connectMs = 10_000, dailySessions = 2000, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('TUNNEL_TOKEN must have at least 32 characters');
   const expected = Buffer.from(`Bearer ${secret}`);

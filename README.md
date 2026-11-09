@@ -114,8 +114,10 @@ restrições da Render continuam aplicáveis; o projeto não mede a fatura do pr
 
 ## Limites e falhas comuns
 
-- Cliente: **512 MiB por mês UTC**, com contabilidade persistente e conservadora.
-- Relay: **128 MiB por processo**, 32 túneis simultâneos, 16 MiB por túnel e 2.000
+- Cliente: **4 GiB por mês UTC** (uso pessoal), com contabilidade persistente e conservadora.
+  O Render Free inclui 5 GB/mês de saída e suspende os serviços até o mês seguinte se
+  isso for excedido sem forma de pagamento; os 4 GiB deixam margem para overhead.
+- Relay: **4 GiB por processo**, 32 túneis simultâneos, 1 GiB por túnel e 2.000
   aberturas por dia. O cliente usa até 24 túneis e uma fila limitada.
 - O Render Free suspende serviços ociosos e pode restringir saída incomum. Não há
   pings artificiais para impedir a suspensão nem garantia de disponibilidade.

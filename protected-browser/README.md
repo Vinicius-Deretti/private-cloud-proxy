@@ -18,7 +18,7 @@ O Chrome tradicional **não é modificado**. Este é outro navegador, com perfil
 - Somente navegação HTTP/HTTPS com proxy fixo `127.0.0.1:17831`; se o proxy parar, a navegação falha. WebRTC/UDP não recebe tunelamento.
 - Não precisa de administrador. O navegador executa com sandbox de renderização, context isolation e sem Node.js nas páginas remotas.
 - O aplicativo não configura `ignore-certificate-errors` nem desativa verificação TLS.
-- As quotas locais (512 MiB/mês) e remotas (128 MiB/processo, além dos limites da Render) continuam valendo.
+- As quotas locais (4 GiB/mês) e remotas (4 GiB/processo, além dos 5 GB/mês de saída do Render Free) continuam valendo.
 - O binário é compilado pela ação GitHub em Windows. Por ser uma prévia **sem assinatura digital**, o Windows pode alertar ao executar. Confira origem, hash SHA-256 e o código-fonte antes de executar.
 - Para voltar ao navegador padrão, execute `Start-Private-Proxy.cmd` no mesmo pacote.
 

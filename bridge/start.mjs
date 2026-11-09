@@ -8,8 +8,9 @@ import { createLocalProxy, validateEndpoint } from './client.mjs';
 import { Budget } from './budget.mjs';
 import { loadProjectEnv } from './env.mjs';
 
-// A bounded personal browser budget. Render's account-wide traffic is separate.
-const CLIENT_MONTHLY_LIMIT_BYTES = 512 * 1024 * 1024;
+// Uso pessoal (um unico usuario). O Render Free inclui 5 GB/mes de saida e
+// suspende os servicos ao exceder sem pagamento; 4 GiB deixa margem para overhead.
+const CLIENT_MONTHLY_LIMIT_BYTES = 4 * 1024 * 1024 * 1024;
 
 class HiddenOutput extends Writable {
   hidden = false;
@@ -73,6 +74,11 @@ try {
   if (protectedExe && (!path.isAbsolute(protectedExe) || !fs.existsSync(browser))) {
     throw new Error('Protected browser executable missing');
   }
+  // Desenvolvimento: Electron do repositório + pasta do app (user-chrome).
+  const protectedApp = protectedExe && process.env.PCP_PROTECTED_BROWSER_APP;
+  if (protectedApp && (!path.isAbsolute(protectedApp) || !fs.existsSync(path.join(protectedApp,'package.json')))) {
+    throw new Error('Protected browser app missing');
+  }
   stage='directory';
   const directory = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(),'.local','share'), 'PrivateCloudProxy');
   fs.mkdirSync(directory,{recursive:true});
@@ -118,7 +124,7 @@ try {
   const remote=await proxy.checkRelay();
   console.log(`Servico autenticado e pronto em ${remote.readyMs} ms. Trafego restante no servidor: ${Math.floor((remote.processLimit-remote.bytes)/1024)} KiB.`);
   stage='browser_launch';
-  const browserArgs = protectedExe ? [] : [`--user-data-dir=${path.join(directory,'ChromiumBridge')}`,
+  const browserArgs = protectedExe ? (protectedApp ? [path.resolve(protectedApp)] : []) : [`--user-data-dir=${path.join(directory,'ChromiumBridge')}`,
     `--proxy-server=http://127.0.0.1:${port}`, '--proxy-bypass-list=<-loopback>',
     '--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
     '--dns-prefetch-disable', '--no-first-run', 'https://example.com'];
