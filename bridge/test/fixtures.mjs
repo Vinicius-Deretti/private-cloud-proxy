@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import https from 'node:https';
+import tls from 'node:tls';
 import http from 'node:http';
 import { execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -56,6 +57,27 @@ export function request(f, { url = `http://remote-only.invalid:${f.httpPort}/hel
     req.on('error',reject); if(body)req.write(body);req.end();
   });
 }
-export async function curl(f, args=[]) {
-  return run('curl',['-sS','--max-time','5','--noproxy','','--proxy',`http://127.0.0.1:${f.clientPort}`,'--cacert',path.join(f.dir,'ca.pem'),...args,`https://localhost:${f.httpsPort}/hello`]);
+// HTTPS through the local proxy's CONNECT with full origin TLS verification.
+// Pure Node (no curl) so it behaves the same on Linux and Windows/Schannel.
+export function httpsViaProxy(f, { ca = fs.readFileSync(path.join(f.dir,'ca.pem')), timeoutMs = 5000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host:'127.0.0.1', port:f.clientPort, method:'CONNECT', path:`localhost:${f.httpsPort}` });
+    const timer = setTimeout(() => { req.destroy(); reject(Object.assign(new Error('timeout'), { code:'ETIMEDOUT' })); }, timeoutMs);
+    const done = (fn, value) => { clearTimeout(timer); fn(value); };
+    req.on('error', error => done(reject, error));
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) { socket.destroy(); return done(reject, Object.assign(new Error(`CONNECT ${res.statusCode}`), { code:'CONNECT_FAILED' })); }
+      const secure = tls.connect({ socket, servername:'localhost', ca, rejectUnauthorized:true }, () => {
+        // HTTP/1.0 => unchunked body, server closes. write() (not end()) mirrors curl: no half-close.
+        secure.write('GET /hello HTTP/1.0\r\nHost: localhost\r\n\r\n');
+      });
+      const chunks=[]; secure.on('data', c => chunks.push(c)); secure.on('error', error => done(reject, error));
+      secure.on('end', () => {
+        const raw = Buffer.concat(chunks).toString(), split = raw.indexOf('\r\n\r\n');
+        const status = Number(/^HTTP\/1\.[01] (\d{3})/.exec(raw)?.[1]);
+        done(status ? resolve : reject, status ? { status, stdout: raw.slice(split + 4) } : Object.assign(new Error('no HTTP response'), { code:'EPROTO' }));
+      });
+    });
+    req.end();
+  });
 }

@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { createLocalProxy, validateEndpoint } from './client.mjs';
 import { Budget } from './budget.mjs';
 import { loadProjectEnv } from './env.mjs';
+import { acquireLock } from './lock.mjs';
 
 // Uso pessoal (um unico usuario). O Render Free inclui 5 GB/mes de saida e
 // suspende os servicos ao exceder sem pagamento; 4 GiB deixa margem para overhead.
@@ -60,7 +61,7 @@ function startupFailure(stage,error) {
   return ['CLIENT_START_FAILED','Nao foi possivel iniciar o cliente. Informe somente este codigo de erro.'];
 }
 let proxy; let lock;let stage='browser';
-function releaseLock() { if (lock) { try { fs.unlinkSync(lock); } catch {} lock = undefined; } }
+function releaseLock() { if (lock) { lock.release(); lock = undefined; } }
 process.once('exit', releaseLock);
 try {
   stage='env';
@@ -84,13 +85,8 @@ try {
   fs.mkdirSync(directory,{recursive:true});
   stage='lock';
   const lockFile = path.join(directory,'bridge.lock');
-  if (fs.existsSync(lockFile)) {
-    const pid = Number(fs.readFileSync(lockFile,'utf8'));
-    if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('Invalid client lock');
-    try { process.kill(pid,0); throw new Error('Client already active'); }
-    catch (error) { if (error.code !== 'ESRCH') throw error; fs.unlinkSync(lockFile); }
-  }
-  fs.writeFileSync(lockFile,String(process.pid),{flag:'wx',mode:0o600});lock=lockFile;
+  // Live PID + recent heartbeat; stale locks (crash, PID reuse) are replaced.
+  lock = acquireLock(lockFile);
   stage='endpoint';
   const settingsFile = path.join(directory,'bridge-endpoint.json');
   let endpoint = process.env.TUNNEL_URL;
@@ -116,7 +112,9 @@ try {
   const secret = process.env.TUNNEL_TOKEN || await ask('Segredo do serviço (entrada oculta; não será salvo): ',true);
   if(typeof secret!=='string' || secret.length<32)throw new Error('Invalid secret');
   stage='proxy';
-  proxy = createLocalProxy({ endpoint, secret, budget });
+  // Optional idle-tunnel pool (OFF unless measured; see docs/PERFORMANCE.md).
+  const poolSize = Number(process.env.PCP_TUNNEL_POOL || 0);
+  proxy = createLocalProxy({ endpoint, secret, budget, poolSize: Number.isInteger(poolSize) && poolSize >= 0 && poolSize <= 4 ? poolSize : 0 });
   stage='listen';
   const port = await proxy.listen(17831);
   stage='relay';

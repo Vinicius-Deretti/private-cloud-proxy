@@ -2,21 +2,23 @@ import http from 'node:http';
 import { connectPinned } from './connect.mjs';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { WebSocketServer, WebSocket, createWebSocketStream } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
+import { createTunnelStream, HALF_CLOSE_HEADER } from './tunnel-stream.mjs';
 import { createCachedPublicResolver, target } from './policy.mjs';
 import { Budget, meter } from './budget.mjs';
 import { report as emit } from './diagnostics.mjs';
 import { openFastOpen } from './fast-open.mjs';
 import { loadProjectEnv } from './env.mjs';
+import { RELAY_MAX_SESSIONS } from './limits.mjs';
 
 // Interactive sites may maintain idle-but-valid HTTPS connections for extended periods.
 // Both limits remain bounded; byte/session quotas are enforced independently.
 export const DEFAULT_RELAY_TIMEOUTS = Object.freeze({ idleMs: 120_000, lifetimeMs: 1_800_000 });
 
 export function createRelay({ secret, server = http.createServer(), resolve = createCachedPublicResolver(), connect = connectPinned,
-  ports = new Set([80, 443]), maxSessions = 32, maxBytes = 1024 * 1024 * 1024,
+  ports = new Set([80, 443]), maxSessions = RELAY_MAX_SESSIONS, maxBytes = 1024 * 1024 * 1024,
   processBytes = 4 * 1024 * 1024 * 1024, idleMs = DEFAULT_RELAY_TIMEOUTS.idleMs, lifetimeMs = DEFAULT_RELAY_TIMEOUTS.lifetimeMs,
-  connectMs = 10_000, dailySessions = 2000, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
+  connectMs = 10_000, dailySessions = 2000, halfClose = true, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('TUNNEL_TOKEN must have at least 32 characters');
   const expected = Buffer.from(`Bearer ${secret}`);
   const budget = new Budget({ limit: processBytes });
@@ -46,9 +48,11 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
     if (req.url === '/usage' && req.method === 'GET') {
       if (!authorized(req)) { res.writeHead(401, { 'Cache-Control': 'no-store' }); res.end(); return; }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      res.end(JSON.stringify({ active: connections.size, sessions: count, day, bytes: budget.used, processLimit: budget.limit, fastOpen: true })); return;
+      res.end(JSON.stringify({ active: connections.size, sessions: count, day, bytes: budget.used, processLimit: budget.limit, fastOpen: true, pool: true })); return;
     }
-    if (req.url === '/health' && /^[a-f0-9]{40}$/.test(process.env.RENDER_GIT_COMMIT || '')) res.setHeader('X-Relay-Revision', process.env.RENDER_GIT_COMMIT);
+    // /health stays public for the platform probe; the deployed revision is a
+    // fingerprint and is disclosed only to authenticated callers.
+    if (req.url === '/health' && authorized(req) && /^[a-f0-9]{40}$/.test(process.env.RENDER_GIT_COMMIT || '')) res.setHeader('X-Relay-Revision', process.env.RENDER_GIT_COMMIT);
     res.writeHead(req.method === 'GET' && req.url === '/health' ? 200 : 404, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
     res.end(req.url === '/health' ? 'ok' : 'not found');
   });
@@ -71,6 +75,13 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
     if (day !== today) { day = today; count = 0; }
     const trafficExhausted=budget.limit-budget.used<8192;
     if (connections.size >= maxSessions || count >= dailySessions || trafficExhausted) { const event=report('limit', {failure:trafficExhausted ? 'TRAFFIC_LIMIT' : count >= dailySessions ? 'SESSION_QUOTA' : 'SESSION_LIMIT'}); return reject(socket, '429 Too Many Requests', event.failure, event.id); }
+    // Half-close is used only when this client asked for it (old clients keep
+    // the previous close-on-end framing).
+    const sessionHalfClose = halfClose && req.headers[HALF_CLOSE_HEADER] === '1';
+    // Pooled tunnel (optional client feature): authenticated now, destination
+    // later. It may wait for its destination up to idleMs instead of
+    // connectMs; it still occupies a session slot and obeys every limit.
+    const pooled = req.headers['x-tunnel-pool'] === '1' && !earlyTarget;
     wss.handleUpgrade(req, socket, head, ws => {
       connections.add(ws); count++;
       let upstream, stream, idle, lastActivityAt = 0, total = 0, finished = false, denied = false;
@@ -87,7 +98,9 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
         clearTimeout(timers[0]);
         timers.push(setTimeout(finish, 1000));
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ ready: false, failure: event.failure, id: event.id }), error => {
+          // code is from the fixed diagnostics allowlist (never a host or message);
+          // it lets the client tell NXDOMAIN (definitive) from transient DNS.
+          ws.send(JSON.stringify({ ready: false, failure: event.failure, id: event.id, code: event.code }), error => {
             if (error) finish(); else ws.close(1008, 'Unavailable');
           });
         } else finish();
@@ -109,10 +122,12 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
       };
       ws.on('error', finish); ws.on('close', finish);
       let stage = 'opening';
-      timers.push(setTimeout(() => { deny(report(stage === 'dns' ? 'dns_timeout' : stage === 'tcp' ? 'tcp_timeout' : 'opening_timeout', {code:'ETIMEDOUT'})); }, connectMs), setTimeout(finish, lifetimeMs));
+      const openingDeadline = () => { deny(report(stage === 'dns' ? 'dns_timeout' : stage === 'tcp' ? 'tcp_timeout' : 'opening_timeout', {code:'ETIMEDOUT'})); };
+      timers.push(setTimeout(openingDeadline, pooled ? idleMs : connectMs), setTimeout(finish, lifetimeMs));
       const startDestination = async (message, binary) => {
         try {
           if (binary || message.length > 1024) throw new Error('Invalid opening');
+          if (pooled) { clearTimeout(timers[0]); timers[0] = setTimeout(openingDeadline, connectMs); }
           const { host, port } = JSON.parse(message.toString());
           stage = 'policy';
           target(host, port, ports);
@@ -123,7 +138,7 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
           const addresses = Array.isArray(resolved) ? resolved : [resolved];
           // Only the validated snapshot reaches the socket's custom lookup.
           stage = 'tcp';
-          upstream = connect(addresses, port);
+          upstream = connect(addresses, port, { allowHalfOpen: sessionHalfClose });
           upstream.on('connectionAttemptFailed', (_address, _port, _family, error) => report('tcp', error));
           upstream.on('connectionAttemptTimeout', () => report('tcp_timeout', {code:'ETIMEDOUT'}));
           upstream.once('error', error => { const event=report(stage, error.errors?.at(-1) || error); if (stage === 'tcp') deny(event); else finish(); });
@@ -131,8 +146,8 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
             if (finished || denied) return;
             clearTimeout(timers[0]);
             stage = 'connected';
-            ws.send(JSON.stringify({ ready: true, id }));
-            stream = createWebSocketStream(ws, { highWaterMark: 65536 });
+            ws.send(JSON.stringify(sessionHalfClose ? { ready: true, id, halfClose: true } : { ready: true, id }));
+            stream = createTunnelStream(ws, { halfClose: sessionHalfClose, legacyFinal: 'close', highWaterMark: 65536 });
             const consume = bytes => {
               try {
                 if ((total += bytes) > maxBytes) throw new Error('Session limit');

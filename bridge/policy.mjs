@@ -15,7 +15,10 @@ export function isPublic(address) {
 
 export function target(host, port, ports = new Set([80, 443])) {
   if (typeof host !== 'string' || !host || host.length > 253 || /[\s/@?#\\\x00-\x1f]/.test(host) || !ports.has(port)) throw new Error('Destination denied');
-  if (!net.isIP(host) && !host.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))) throw new Error('Invalid hostname');
+  // Real-world DNS names may contain '_' (CDN/SaaS hosts, e.g. a_b.example.com).
+  // This only widens the hostname syntax; resolved addresses are still
+  // validated (public unicast only) before any socket is opened.
+  if (!net.isIP(host) && !host.split('.').every(label => /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/i.test(label))) throw new Error('Invalid hostname');
   return { host, port };
 }
 

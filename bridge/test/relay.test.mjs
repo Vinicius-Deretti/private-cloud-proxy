@@ -1,13 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import tls from 'node:tls';
 
 test('relay and client components exist', () => {
   assert.ok(fs.existsSync(new URL('../server.mjs', import.meta.url)), 'remote relay missing');
   assert.ok(fs.existsSync(new URL('../client.mjs', import.meta.url)), 'local client missing');
 });
 
-import { fixture, request, curl, SECRET } from './fixtures.mjs';
+import { fixture, request, httpsViaProxy, SECRET } from './fixtures.mjs';
 
 test('HTTP and HTTPS CONNECT traverse authenticated WSS with explicit CA', async () => {
   const f=await fixture();
@@ -16,7 +17,7 @@ test('HTTP and HTTPS CONNECT traverse authenticated WSS with explicit CA', async
     const http=await request(f); assert.equal(http.status,200);assert.equal(http.body,'bridge-origin-ok');
     assert.ok(f.relay.usage().bytes > 20,'HTTP bytes must pass through WSS, not a direct client socket');
     const post=await request(f,{method:'POST',body:'bidirectional payload'});assert.equal(post.body,'bidirectional payload');
-    const https=await curl(f);assert.equal(https.stdout,'bridge-origin-ok');
+    const https=await httpsViaProxy(f);assert.equal(https.stdout,'bridge-origin-ok');
     assert.ok(f.lookups.length>=3,'remote relay must resolve every connection');
   } finally { await f.close(); }
 });
@@ -53,7 +54,7 @@ test('concurrency works and failure never falls back to direct origin', async ()
 test('session byte cap terminates transfer', async () => {
   const f=await fixture({relayOptions:{maxBytes:1024}});
   try {
-    await assert.rejects(curl(f));
+    await assert.rejects(httpsViaProxy(f));
     const result=await request(f,{url:`http://localhost:${f.httpPort}/large`}).catch(()=>({status:502}));
     assert.ok(!result.body || result.body.length < 32768, 'byte cap must prevent full response');
   } finally { await f.close(); }
@@ -101,7 +102,8 @@ test('missing authentication is rejected at WebSocket upgrade', async () => {
 test('origin TLS verification stays end-to-end through CONNECT', async () => {
   const f=await fixture();
   try {
-    await assert.rejects(curl(f,['--cacert','/etc/ssl/certs/ca-certificates.crt']),error=>error.code===60);
+    // Public roots only: the private test CA must NOT be trusted, so the origin cert is rejected end-to-end.
+    await assert.rejects(httpsViaProxy(f,{ca:tls.rootCertificates}),error=>['SELF_SIGNED_CERT_IN_CHAIN','UNABLE_TO_VERIFY_LEAF_SIGNATURE','UNABLE_TO_GET_ISSUER_CERT_LOCALLY'].includes(error.code));
   } finally {await f.close();}
 });
 
