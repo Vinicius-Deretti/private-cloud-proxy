@@ -2,6 +2,7 @@
 import pathlib
 import os
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ class PackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='proxy-package-') as directory:
             root = pathlib.Path(directory)
             archive = root / 'client.zip'
-            subprocess.run(['python3', str(ROOT / 'scripts/package-free.py'), '--output', str(archive)], check=True, capture_output=True)
+            subprocess.run([sys.executable, str(ROOT / 'scripts/package-free.py'), '--output', str(archive)], check=True, capture_output=True)
             with zipfile.ZipFile(archive) as bundle:
                 bundle.extractall(root / 'extracted')
             subprocess.run(['node', 'bridge/bootstrap.mjs'], cwd=root / 'extracted', env={**os.environ, 'npm_config_offline':'true', 'npm_config_cache':str(root/'empty-cache')}, check=True, capture_output=True, text=True)
