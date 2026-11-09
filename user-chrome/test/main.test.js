@@ -17,6 +17,8 @@ test('inicializa controles de rede na sessao Chromium e abre configuracoes isola
   class FakeBrowserWindow {
     constructor(options) { browserWindowOptions.push(options); windows.push(this) }
     setContentProtection() {}
+    once() {}
+    show() {}
     loadURL() {}
     loadFile() {}
     on() {}

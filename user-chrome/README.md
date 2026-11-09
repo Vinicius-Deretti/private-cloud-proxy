@@ -20,6 +20,23 @@ O Chromium recebe um PAC: cada domínio e subdomínio listado retorna somente `P
 
 Aplicativo Electron para Windows com proteção de tela nativa.
 
+### Proteção contra captura de tela
+
+Todas as janelas usam `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` do
+Windows 10 2004+ (via `setContentProtection`, em `window-protection.js`). Print
+Screen, Ferramenta de Captura, Xbox Game Bar e gravadores que usam as APIs do
+Windows mostram a janela em preto ou transparente.
+
+- As janelas são criadas ocultas e só aparecem depois que a proteção está ativa.
+- A proteção é reaplicada ao exibir, restaurar, maximizar, entrar/sair de tela
+  cheia e receber foco.
+- Qualquer outra janela criada pelo aplicativo também é protegida; DevTools é
+  fechado automaticamente, pois abriria uma janela fora da proteção.
+
+Não há proteção contra fotografias da tela, drivers de captura ou software com
+acesso privilegiado. Menus nativos e caixas de diálogo do sistema não são
+cobertos.
+
 ## Navegação
 
 A página inicial é local: abrir uma aba não carrega sites externos. Digite um

@@ -14,6 +14,8 @@ test('failed proxy initialization exits before creating any browser window', asy
   class Window {
     constructor() { windows++ }
     setContentProtection() {}
+    once() {}
+    show() {}
     loadFile() {}
     on() {}
     setBrowserView() {}

@@ -5,11 +5,14 @@ const { app, BrowserWindow, BrowserView, Menu, ipcMain, safeStorage, session, sh
 const { PrivateCloudNetworkManager, PrivateCloudDiagnostics, bridgePort } = require('./network/private-cloud-proxy')
 const { BrowserStore } = require('./browser/browser-store')
 const { TabManager } = require('./browser/tab-manager')
+const { protegerJanela, protegerTodasAsJanelas } = require('./window-protection')
 
 // Keep all navigation on the existing TCP proxy, including WebRTC policy.
 app.commandLine.appendSwitch('disable-quic')
 app.commandLine.appendSwitch('force-webrtc-ip-handling-policy', 'disable_non_proxied_udp')
 app.commandLine.appendSwitch('dns-prefetch-disable')
+
+protegerTodasAsJanelas(app)
 
 const browsers = new Map()
 
@@ -107,12 +110,13 @@ function criarNavegador(store) {
     minWidth: 780,
     minHeight: 560,
     title: 'Chrome Protegido',
+    show: false,
     backgroundColor: '#f4f6fb',
     autoHideMenuBar: false,
     skipTaskbar: true,
     webPreferences: { nodeIntegration: false, contextIsolation: true, preload: path.join(__dirname, 'preload-browser-shell.js') }
   })
-  minhaJanela.setContentProtection(true)
+  protegerJanela(minhaJanela)
   minhaJanela.loadFile(path.join(__dirname, 'renderer', 'browser-shell.html'))
   const tabs = new TabManager({ BrowserView, window: minhaJanela, store, notify: state => minhaJanela.webContents.send('browser:state', state) })
   browsers.set(minhaJanela.webContents, { tabs, window: minhaJanela })
@@ -133,13 +137,14 @@ function criarJanelaConfiguracoes() {
     width: 760,
     height: 820,
     title: 'Configurações de rede',
+    show: false,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload-network-settings.js')
     }
   })
-  janela.setContentProtection(true)
+  protegerJanela(janela)
   janela.loadFile(path.join(__dirname, 'renderer', 'network-settings.html'))
   return janela
 }
