@@ -49,7 +49,9 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ active: connections.size, sessions: count, day, bytes: budget.used, processLimit: budget.limit, fastOpen: true })); return;
     }
-    if (req.url === '/health' && /^[a-f0-9]{40}$/.test(process.env.RENDER_GIT_COMMIT || '')) res.setHeader('X-Relay-Revision', process.env.RENDER_GIT_COMMIT);
+    // /health stays public for the platform probe; the deployed revision is a
+    // fingerprint and is disclosed only to authenticated callers.
+    if (req.url === '/health' && authorized(req) && /^[a-f0-9]{40}$/.test(process.env.RENDER_GIT_COMMIT || '')) res.setHeader('X-Relay-Revision', process.env.RENDER_GIT_COMMIT);
     res.writeHead(req.method === 'GET' && req.url === '/health' ? 200 : 404, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
     res.end(req.url === '/health' ? 'ok' : 'not found');
   });
