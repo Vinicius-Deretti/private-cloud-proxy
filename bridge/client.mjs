@@ -35,12 +35,27 @@ function removeHopHeaders(headers) {
   return result;
 }
 
-// All retries stay within the active browser request deadline. A temporary remote
-// session ceiling is not a reason to wait through exponential-second backoff.
-export function retryDelayMs(failure, attempt, retryMs, remainingMs, random = Math.random) {
+// Retry classification (all retries stay within the request deadline):
+// - Relay/cold-start transport failures (WSS_CONNECTION_FAILED, 5xx, close
+//   before verdict, SESSION_LIMIT): retried with the cold-start backoff.
+// - Transient destination failures reported by the relay verdict
+//   (DNS_FAILED except NXDOMAIN, TCP_CONNECT_TIMEOUT, NETWORK_UNREACHABLE) and
+//   a tunnel closed after its verdict but before any byte was handed to the
+//   browser (REMOTE_SOCKET_CLOSED): retried at most DESTINATION_RETRIES times
+//   with a short backoff, so a mistyped domain fails fast.
+// - Definitive: AUTH_FAILED, DNS_REJECTED/policy, TRAFFIC_LIMIT, TLS/cert
+//   errors, TCP_CONNECTION_REFUSED, NXDOMAIN, and anything after data flowed.
+export const DESTINATION_RETRIES = 2;
+export const DESTINATION_RETRY_MS = 250;
+const TRANSIENT_DESTINATION = new Set(['DNS_FAILED', 'TCP_CONNECT_TIMEOUT', 'NETWORK_UNREACHABLE']);
+export function retryableVerdict(failure, code) {
+  return TRANSIENT_DESTINATION.has(failure) && code !== 'ENOTFOUND';
+}
+export function retryDelayMs(failure, attempt, retryMs, remainingMs, random = Math.random, destination = false) {
   if (remainingMs <= 0) return 0;
   const delay = failure === 'SESSION_LIMIT'
     ? 75 + Math.floor(Math.max(0, Math.min(0.999999, random())) * 125)
+    : destination ? DESTINATION_RETRY_MS * 2 ** attempt
     : Math.min(retryMs * 2 ** attempt, 10_000);
   return Math.min(delay, remainingMs);
 }
@@ -171,6 +186,7 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
           const error = new Error('Encrypted tunnel unavailable');
           error.failure=event.failure;error.id=event.id;
           error.retryable = cause?.retryable !== false && !/CERT|TLS|SELF_SIGNED/.test(cause?.code || '');
+          error.destination = cause?.destination === true;
           reject(error);
         }
       };
@@ -193,7 +209,10 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
         try {
           if (binary) throw new Error();
           const verdict=JSON.parse(message.toString());
-          if (verdict.ready !== true) { fail({retryable:false,failure:failures.has(verdict.failure)?verdict.failure:'INTERNAL_ERROR',id:verdict.id}); return; }
+          if (verdict.ready !== true) {
+            const failure = failures.has(verdict.failure) ? verdict.failure : 'INTERNAL_ERROR';
+            fail({ retryable: retryableVerdict(failure, verdict.code), destination: true, failure, id: verdict.id }); return;
+          }
           settled = true; clearTimeout(timer); pending.delete(ws); active.add(ws);
           if(/^[a-f0-9-]{36}$/.test(verdict.id||''))sessionIds.set(ws,verdict.id);
           // Old relays omit halfClose: keep reading after a local half-close
@@ -222,6 +241,7 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
     let handedOff=false;
     try {
       const deadline=Date.now()+connectWindowMs;
+      let destinationRetries=0;
       for(let attempt=0;attempt<attempts;attempt++) {
         if(stopped || remoteQuotaExhausted || signal?.aborted || Date.now()>=deadline || traffic())break;
         try {
@@ -233,13 +253,19 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
           // local WSS closes. The remote DELETE still runs independently.
           activity.set(remote.ws, { lastDataAt: performance.now() });
           remote.ws.once('close', () => { activity.delete(remote.ws); release(); });
-          if(stopped || signal?.aborted || remote.ws.readyState!==WebSocket.OPEN){endTunnel(remote.ws);throw new Error('Cancelled');}
+          if(stopped || signal?.aborted){endTunnel(remote.ws);throw new Error('Cancelled');}
+          if(remote.ws.readyState!==WebSocket.OPEN){
+            // Closed after the verdict, before any byte reached the browser.
+            endTunnel(remote.ws);
+            throw Object.assign(new Error('Tunnel closed before data'),{failure:'REMOTE_SOCKET_CLOSED',retryable:true,destination:true});
+          }
           handedOff=true;return remote;
         }catch(error){
           if(!error.retryable)break;
+          if(error.destination && destinationRetries++>=DESTINATION_RETRIES)break;
           if(attempt+1<attempts && !stopped && !signal?.aborted)await new Promise(resolve=>{
             const done=()=>{clearTimeout(timer);signal?.removeEventListener('abort',done);resolve();};
-            const timer=setTimeout(done,retryDelayMs(error.failure,attempt,retryMs,deadline-Date.now()));
+            const timer=setTimeout(done,retryDelayMs(error.failure,error.destination?destinationRetries-1:attempt,retryMs,deadline-Date.now(),Math.random,error.destination));
             signal?.addEventListener('abort',done,{once:true});if(signal?.aborted)done();
           });
         }

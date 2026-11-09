@@ -93,7 +93,9 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
         clearTimeout(timers[0]);
         timers.push(setTimeout(finish, 1000));
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ ready: false, failure: event.failure, id: event.id }), error => {
+          // code is from the fixed diagnostics allowlist (never a host or message);
+          // it lets the client tell NXDOMAIN (definitive) from transient DNS.
+          ws.send(JSON.stringify({ ready: false, failure: event.failure, id: event.id, code: event.code }), error => {
             if (error) finish(); else ws.close(1008, 'Unavailable');
           });
         } else finish();
