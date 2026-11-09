@@ -9,13 +9,14 @@ import { Budget, meter } from './budget.mjs';
 import { report as emit } from './diagnostics.mjs';
 import { openFastOpen } from './fast-open.mjs';
 import { loadProjectEnv } from './env.mjs';
+import { RELAY_MAX_SESSIONS } from './limits.mjs';
 
 // Interactive sites may maintain idle-but-valid HTTPS connections for extended periods.
 // Both limits remain bounded; byte/session quotas are enforced independently.
 export const DEFAULT_RELAY_TIMEOUTS = Object.freeze({ idleMs: 120_000, lifetimeMs: 1_800_000 });
 
 export function createRelay({ secret, server = http.createServer(), resolve = createCachedPublicResolver(), connect = connectPinned,
-  ports = new Set([80, 443]), maxSessions = 32, maxBytes = 1024 * 1024 * 1024,
+  ports = new Set([80, 443]), maxSessions = RELAY_MAX_SESSIONS, maxBytes = 1024 * 1024 * 1024,
   processBytes = 4 * 1024 * 1024 * 1024, idleMs = DEFAULT_RELAY_TIMEOUTS.idleMs, lifetimeMs = DEFAULT_RELAY_TIMEOUTS.lifetimeMs,
   connectMs = 10_000, dailySessions = 2000, halfClose = true, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('TUNNEL_TOKEN must have at least 32 characters');

@@ -5,6 +5,7 @@ import https from 'node:https';
 import { WebSocket } from 'ws';
 import { createTunnelStream } from './tunnel-stream.mjs';
 import { RelayAgent, STICKY_FAMILY_DEFAULT } from './tls-resume.mjs';
+import { CLIENT_MAX_SESSIONS, CLIENT_MAX_QUEUED, CLIENT_QUEUE_WAIT_MS, CLIENT_IDLE_EVICT_MS, RELAY_MAX_SESSIONS } from './limits.mjs';
 import { Budget, meter } from './budget.mjs';
 import { target } from './policy.mjs';
 import { SessionQueue } from './session-queue.mjs';
@@ -73,14 +74,14 @@ export function retryDelayMs(failure, attempt, retryMs, remainingMs, random = Ma
 }
 
 export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), ports = new Set([80, 443]),
-  proxyEnv = process.env, openTimeoutMs = 10_000, attempts = 12, retryMs = 1000, connectWindowMs = 90_000, maxSessions = 24, maxQueued = 32, queueWaitMs = 20_000,
-  idleEvictMs = 90_000, halfCloseIdleMs = HALF_CLOSE_IDLE_MS, stickyFamily = STICKY_FAMILY_DEFAULT, relayLookup, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
+  proxyEnv = process.env, openTimeoutMs = 10_000, attempts = 12, retryMs = 1000, connectWindowMs = 90_000, maxSessions = CLIENT_MAX_SESSIONS, maxQueued = CLIENT_MAX_QUEUED, queueWaitMs = CLIENT_QUEUE_WAIT_MS,
+  idleEvictMs = CLIENT_IDLE_EVICT_MS, halfCloseIdleMs = HALF_CLOSE_IDLE_MS, stickyFamily = STICKY_FAMILY_DEFAULT, relayLookup, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
   endpoint = validateEndpoint(endpoint);
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('Secret must have at least 32 characters');
   // Reuse authenticated HTTPS control sockets for readiness and cancellation.
   // Shared agent: TLS sessions are resumed across WSS tunnels; the relay's
   // working address family is tried first so fallback never drops tickets.
-  const agent = new RelayAgent({ stickyFamily, ...(relayLookup ? { lookup: relayLookup } : {}), proxyEnv, keepAlive: true, maxSockets: 32, maxFreeSockets: 4 });
+  const agent = new RelayAgent({ stickyFamily, ...(relayLookup ? { lookup: relayLookup } : {}), proxyEnv, keepAlive: true, maxSockets: RELAY_MAX_SESSIONS, maxFreeSockets: 4 });
   if (!Number.isFinite(idleEvictMs) || idleEvictMs < 0) throw new Error('Invalid idle eviction threshold');
   if (!Number.isFinite(halfCloseIdleMs) || halfCloseIdleMs < 0) throw new Error('Invalid half-close idle threshold');
   const queue = new SessionQueue({limit:maxSessions,maxPending:maxQueued,waitMs:queueWaitMs});
