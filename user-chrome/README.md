@@ -41,7 +41,7 @@ cobertos.
 
 A página inicial é local: abrir uma aba não carrega sites externos. Digite um
 endereço ou uma busca na barra superior ou no campo central. Buscas usam
-DuckDuckGo; endereços locais como `localhost:8080` e `127.0.0.1:3000` são aceitos.
+Google (o DuckDuckGo não responde pelo servidor no Render); endereços locais como `localhost:8080` e `127.0.0.1:3000` são aceitos.
 
 - Feche uma aba pelo **×** ou pelo botão do meio do mouse. Fechar a última abre
   uma nova aba local. Até dez abas fechadas podem ser reabertas durante a sessão.

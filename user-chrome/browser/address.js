@@ -12,6 +12,6 @@ function normalizeAddress(input) {
     if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Apenas URLs HTTP(S) sao permitidas.')
     return url.toString()
   }
-  return `https://duckduckgo.com/?q=${encodeURIComponent(value)}`
+  return `https://www.google.com/search?q=${encodeURIComponent(value)}`
 }
 module.exports = { normalizeAddress }

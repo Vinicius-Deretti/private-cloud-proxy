@@ -5,7 +5,7 @@ const { BrowserStore } = require('../browser/browser-store')
 
 test('normaliza URL HTTP e texto de busca', () => {
   assert.equal(normalizeAddress('https://example.com/a'), 'https://example.com/a')
-  assert.equal(normalizeAddress('pesquisa segura'), 'https://duckduckgo.com/?q=pesquisa%20segura')
+  assert.equal(normalizeAddress('pesquisa segura'), 'https://www.google.com/search?q=pesquisa%20segura')
   assert.throws(() => normalizeAddress('javascript:alert(1)'), /HTTP/)
 })
 
@@ -54,5 +54,5 @@ test('abre dominios internacionalizados digitados sem protocolo', () => {
   assert.equal(normalizeAddress('exemplo.empresa.br/caminho'), 'https://exemplo.empresa.br/caminho')
   assert.equal(normalizeAddress('café.com.br/cardápio'), 'https://xn--caf-dma.com.br/card%C3%A1pio')
   assert.equal(normalizeAddress('例え.テスト'), 'https://xn--r8jz45g.xn--zckzah/')
-  assert.equal(normalizeAddress('pesquisa com espaços'), 'https://duckduckgo.com/?q=pesquisa%20com%20espa%C3%A7os')
+  assert.equal(normalizeAddress('pesquisa com espaços'), 'https://www.google.com/search?q=pesquisa%20com%20espa%C3%A7os')
 })
