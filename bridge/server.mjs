@@ -48,7 +48,7 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
     if (req.url === '/usage' && req.method === 'GET') {
       if (!authorized(req)) { res.writeHead(401, { 'Cache-Control': 'no-store' }); res.end(); return; }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      res.end(JSON.stringify({ active: connections.size, sessions: count, day, bytes: budget.used, processLimit: budget.limit, fastOpen: true })); return;
+      res.end(JSON.stringify({ active: connections.size, sessions: count, day, bytes: budget.used, processLimit: budget.limit, fastOpen: true, pool: true })); return;
     }
     // /health stays public for the platform probe; the deployed revision is a
     // fingerprint and is disclosed only to authenticated callers.
@@ -78,6 +78,10 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
     // Half-close is used only when this client asked for it (old clients keep
     // the previous close-on-end framing).
     const sessionHalfClose = halfClose && req.headers[HALF_CLOSE_HEADER] === '1';
+    // Pooled tunnel (optional client feature): authenticated now, destination
+    // later. It may wait for its destination up to idleMs instead of
+    // connectMs; it still occupies a session slot and obeys every limit.
+    const pooled = req.headers['x-tunnel-pool'] === '1' && !earlyTarget;
     wss.handleUpgrade(req, socket, head, ws => {
       connections.add(ws); count++;
       let upstream, stream, idle, lastActivityAt = 0, total = 0, finished = false, denied = false;
@@ -118,10 +122,12 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
       };
       ws.on('error', finish); ws.on('close', finish);
       let stage = 'opening';
-      timers.push(setTimeout(() => { deny(report(stage === 'dns' ? 'dns_timeout' : stage === 'tcp' ? 'tcp_timeout' : 'opening_timeout', {code:'ETIMEDOUT'})); }, connectMs), setTimeout(finish, lifetimeMs));
+      const openingDeadline = () => { deny(report(stage === 'dns' ? 'dns_timeout' : stage === 'tcp' ? 'tcp_timeout' : 'opening_timeout', {code:'ETIMEDOUT'})); };
+      timers.push(setTimeout(openingDeadline, pooled ? idleMs : connectMs), setTimeout(finish, lifetimeMs));
       const startDestination = async (message, binary) => {
         try {
           if (binary || message.length > 1024) throw new Error('Invalid opening');
+          if (pooled) { clearTimeout(timers[0]); timers[0] = setTimeout(openingDeadline, connectMs); }
           const { host, port } = JSON.parse(message.toString());
           stage = 'policy';
           target(host, port, ports);

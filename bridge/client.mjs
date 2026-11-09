@@ -5,7 +5,7 @@ import https from 'node:https';
 import { WebSocket } from 'ws';
 import { createTunnelStream } from './tunnel-stream.mjs';
 import { RelayAgent, STICKY_FAMILY_DEFAULT } from './tls-resume.mjs';
-import { CLIENT_MAX_SESSIONS, CLIENT_MAX_QUEUED, CLIENT_QUEUE_WAIT_MS, CLIENT_IDLE_EVICT_MS, RELAY_MAX_SESSIONS } from './limits.mjs';
+import { CLIENT_MAX_SESSIONS, CLIENT_MAX_QUEUED, CLIENT_QUEUE_WAIT_MS, CLIENT_IDLE_EVICT_MS, RELAY_MAX_SESSIONS, POOL_MAX_TUNNELS } from './limits.mjs';
 import { Budget, meter } from './budget.mjs';
 import { target } from './policy.mjs';
 import { SessionQueue } from './session-queue.mjs';
@@ -58,6 +58,12 @@ function removeHopHeaders(headers) {
 // - Tunnel payload: every chunk metered, +64 bytes framing allowance.
 export const RELAY_CONNECTION_BYTES = 8192;
 export const CONTROL_REQUEST_BYTES = 2048;
+// Optional pool of pre-authenticated idle tunnels (feature flag, OFF by
+// default; enable only after measuring, see docs/PERFORMANCE.md). Entries
+// expire after POOL_IDLE_MS (below the relay's 120 s idle) and are never
+// replaced on expiry: they are refilled only when a request consumes one
+// while the user was active within POOL_IDLE_MS. No artificial keep-alive.
+export const POOL_IDLE_MS = 100_000;
 export const DESTINATION_RETRIES = 2;
 export const DESTINATION_RETRY_MS = 250;
 const TRANSIENT_DESTINATION = new Set(['DNS_FAILED', 'TCP_CONNECT_TIMEOUT', 'NETWORK_UNREACHABLE']);
@@ -75,7 +81,8 @@ export function retryDelayMs(failure, attempt, retryMs, remainingMs, random = Ma
 
 export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), ports = new Set([80, 443]),
   proxyEnv = process.env, openTimeoutMs = 10_000, attempts = 12, retryMs = 1000, connectWindowMs = 90_000, maxSessions = CLIENT_MAX_SESSIONS, maxQueued = CLIENT_MAX_QUEUED, queueWaitMs = CLIENT_QUEUE_WAIT_MS,
-  idleEvictMs = CLIENT_IDLE_EVICT_MS, halfCloseIdleMs = HALF_CLOSE_IDLE_MS, stickyFamily = STICKY_FAMILY_DEFAULT, relayLookup, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
+  idleEvictMs = CLIENT_IDLE_EVICT_MS, halfCloseIdleMs = HALF_CLOSE_IDLE_MS, stickyFamily = STICKY_FAMILY_DEFAULT, relayLookup,
+  poolSize = 0, poolIdleMs = POOL_IDLE_MS, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
   endpoint = validateEndpoint(endpoint);
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('Secret must have at least 32 characters');
   // Reuse authenticated HTTPS control sockets for readiness and cancellation.
@@ -84,6 +91,8 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
   const agent = new RelayAgent({ stickyFamily, ...(relayLookup ? { lookup: relayLookup } : {}), proxyEnv, keepAlive: true, maxSockets: RELAY_MAX_SESSIONS, maxFreeSockets: 4 });
   if (!Number.isFinite(idleEvictMs) || idleEvictMs < 0) throw new Error('Invalid idle eviction threshold');
   if (!Number.isFinite(halfCloseIdleMs) || halfCloseIdleMs < 0) throw new Error('Invalid half-close idle threshold');
+  if (!Number.isInteger(poolSize) || poolSize < 0 || poolSize > POOL_MAX_TUNNELS) throw new Error('Invalid tunnel pool size');
+  if (!Number.isFinite(poolIdleMs) || poolIdleMs <= 0) throw new Error('Invalid tunnel pool idle time');
   const queue = new SessionQueue({limit:maxSessions,maxPending:maxQueued,waitMs:queueWaitMs});
   // HTTPS prevents classifying keep-alive, HTTP/2, and application WebSockets.
   // Never evict normally. Under admission pressure only, preempt the oldest
@@ -145,7 +154,44 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
     if(ws.readyState===WebSocket.OPEN)ws.close(1000);
     return cancellation;
   }
-  let stopped = false,remoteQuotaExhausted=false,remoteFastOpen=false;
+  let stopped = false,remoteQuotaExhausted=false,remoteFastOpen=false,remotePool=false;
+  const pool=new Set(),poolStats={opened:0,hits:0,misses:0,expired:0};
+  let poolOpening=0,lastUserActivity=-Infinity;
+  function takePooled() {
+    for (const entry of pool) {
+      pool.delete(entry); entry.detach();
+      if (entry.ws.readyState === WebSocket.OPEN) { poolStats.hits++; return entry.ws; }
+      entry.ws.terminate();
+    }
+    if (poolSize > 0) poolStats.misses++;
+    return undefined;
+  }
+  function fillPool() {
+    while (poolSize > 0 && remotePool && !stopped && !remoteQuotaExhausted &&
+      pool.size + poolOpening < poolSize && performance.now() - lastUserActivity < poolIdleMs &&
+      budget.used + RELAY_CONNECTION_BYTES <= budget.limit) {
+      let connection;
+      try { connection = reserveConnection(); } catch { return; }
+      poolOpening++;
+      const ws = new WebSocket(endpoint, { headers: { Authorization: `Bearer ${secret}`, 'X-Tunnel-Half-Close': '1', 'X-Tunnel-Pool': '1' },
+        ca, onTcpConnect: connection.connected, agent, followRedirects: false, rejectUnauthorized: true, minVersion: 'TLSv1.2',
+        handshakeTimeout: openTimeoutMs, perMessageDeflate: false, maxPayload: 65536 });
+      let entry, counted = false;
+      const opening = () => { if (!counted) { counted = true; poolOpening--; } };
+      const onError = () => {};
+      const onClose = () => { opening(); connection.settle(); if (entry) { pool.delete(entry); entry.detach(); } };
+      ws.on('error', onError); ws.once('close', onClose);
+      ws.once('unexpected-response', (_req, res) => { res.resume(); ws.terminate(); });
+      ws.once('open', () => {
+        opening(); poolStats.opened++;
+        if (stopped) { ws.close(1000); return; }
+        const expiry = setTimeout(() => { poolStats.expired++; pool.delete(entry); entry.detach(); ws.close(1000); }, poolIdleMs);
+        expiry.unref();
+        entry = { ws, detach() { clearTimeout(expiry); ws.off('error', onError); ws.off('close', onClose); } };
+        pool.add(entry);
+      });
+    }
+  }
   const probes=new Set();
   // Reserve a relay connection's handshake allowance up front (throws when the
   // budget cannot cover it); settle() refunds it only if TCP never connected.
@@ -194,6 +240,7 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
               if(usage.processLimit-usage.bytes<8192){remoteQuotaExhausted=true;done({failure:'TRAFFIC_LIMIT',source:'remote'});return;}
               remoteQuotaExhausted=false;
               remoteFastOpen=usage.fastOpen===true;
+              remotePool=usage.pool===true;
               done(null,{active:usage.active,sessions:usage.sessions,bytes:usage.bytes,processLimit:usage.processLimit,readyMs:Math.round(performance.now()-started)});
             }catch(error){done(error);}
           });
@@ -205,7 +252,8 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
   function onceTunnel(host, port, timeoutMs, signal) {
     return new Promise((resolve, reject) => {
       let ws, settled = false, connection;
-      const earlyTarget = remoteFastOpen;
+      const pooled = takePooled();
+      const earlyTarget = !pooled && remoteFastOpen;
       const id=crypto.randomUUID(), started=performance.now();
       const fail = cause => {
         if (!settled) {
@@ -222,11 +270,15 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
         if(signal?.aborted)throw Object.assign(new Error('Cancelled'),{failure:'QUEUE_CANCELLED',retryable:false});
         // Reserved for every attempt; refunded only if TCP to the relay never
         // connected. Failed auth/TLS/cold-start replies after TCP stay charged.
-        connection = reserveConnection();
-        const headers = { Authorization: `Bearer ${secret}`, 'X-Tunnel-Half-Close': '1' };
-        if (earlyTarget) headers['X-Tunnel-Open'] = sealFastOpen(secret, host, port);
-        ws = new WebSocket(endpoint, { headers, ca, onTcpConnect: connection.connected,
-          agent, followRedirects: false, rejectUnauthorized: true, minVersion: 'TLSv1.2', handshakeTimeout: timeoutMs, perMessageDeflate: false, maxPayload: 65536 });
+        if (pooled) {
+          ws = pooled; // already authenticated and charged when the pool opened it
+        } else {
+          connection = reserveConnection();
+          const headers = { Authorization: `Bearer ${secret}`, 'X-Tunnel-Half-Close': '1' };
+          if (earlyTarget) headers['X-Tunnel-Open'] = sealFastOpen(secret, host, port);
+          ws = new WebSocket(endpoint, { headers, ca, onTcpConnect: connection.connected,
+            agent, followRedirects: false, rejectUnauthorized: true, minVersion: 'TLSv1.2', handshakeTimeout: timeoutMs, perMessageDeflate: false, maxPayload: 65536 });
+        }
       } catch (error) { fail(error); return; }
       pending.add(ws);
       const timer = setTimeout(fail, timeoutMs);
@@ -234,7 +286,8 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
       ws.once('unexpected-response', (_req, res) => {
         res.resume();if(res.statusCode===429 && res.headers['x-tunnel-failure']==='TRAFFIC_LIMIT')remoteQuotaExhausted=true; fail({ failure:res.statusCode === 401 ? 'AUTH_FAILED' : res.statusCode === 429 ? (failures.has(res.headers['x-tunnel-failure']) ? res.headers['x-tunnel-failure'] : 'SESSION_LIMIT') : 'WSS_CONNECTION_FAILED', id:res.headers['x-tunnel-id'], retryable: res.statusCode === 200 || res.statusCode >= 500 || (res.statusCode === 429 && res.headers['x-tunnel-failure'] === 'SESSION_LIMIT') });
       });
-      ws.once('open', () => { if (!earlyTarget) ws.send(JSON.stringify({ host, port })); });
+      if (pooled) ws.send(JSON.stringify({ host, port }));
+      else ws.once('open', () => { if (!earlyTarget) ws.send(JSON.stringify({ host, port })); });
       ws.once('message', (message, binary) => {
         try {
           if (binary) throw new Error();
@@ -265,6 +318,7 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
       report(diagnostic,'local_limit',{failure:'TRAFFIC_LIMIT'},crypto.randomUUID(),performance.now());return true;
     };
     if(stopped || remoteQuotaExhausted || traffic())throw new Error('Traffic unavailable');
+    lastUserActivity=performance.now();
     let release;const waiting=performance.now();
     try {evictIdleUnderPressure();release=await queue.acquire({signal});}
     catch(error){if(error.failure!=='QUEUE_CANCELLED')report(diagnostic,'local_queue',error,crypto.randomUUID(),waiting);throw error;}
@@ -289,7 +343,7 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
             endTunnel(remote.ws);
             throw Object.assign(new Error('Tunnel closed before data'),{failure:'REMOTE_SOCKET_CLOSED',retryable:true,destination:true});
           }
-          handedOff=true;return remote;
+          handedOff=true;fillPool();return remote;
         }catch(error){
           if(!error.retryable)break;
           if(error.destination && destinationRetries++>=DESTINATION_RETRIES)break;
@@ -386,10 +440,11 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
   server.on('clientError', (_err, socket) => socket.destroy());
   server.headersTimeout = 15_000; server.requestTimeout = 160_000;
   return { server, budget,
-    checkRelay, tlsStats: () => ({ ...agent.tlsStats }),
+    checkRelay, tlsStats: () => ({ ...agent.tlsStats }), poolStats: () => ({ ...poolStats, idle: pool.size }),
     async listen(port = 0) { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); }); return server.address().port; },
     async close() {
       stopped=true;queue.close();activity.clear();for(const probe of probes)probe.destroy();
+      for(const entry of pool){entry.detach();entry.ws.terminate();}pool.clear();
       const ending=Promise.all([...active,...pending].map(ws=>new Promise(resolve=>{
         if(ws.readyState===WebSocket.CLOSED)return resolve();
         ws.once('close',resolve);endTunnel(ws);
