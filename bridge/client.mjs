@@ -2,11 +2,16 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { report, failures } from './diagnostics.mjs';
 import https from 'node:https';
-import { WebSocket, createWebSocketStream } from 'ws';
+import { WebSocket } from 'ws';
+import { createTunnelStream } from './tunnel-stream.mjs';
 import { Budget, meter } from './budget.mjs';
 import { target } from './policy.mjs';
 import { SessionQueue } from './session-queue.mjs';
 import { sealFastOpen } from './fast-open.mjs';
+
+// After a local FIN on a CONNECT tunnel, keep the downstream open while it is
+// active; cancel the tunnel after this much downstream inactivity.
+export const HALF_CLOSE_IDLE_MS = 5_000;
 
 export function validateEndpoint(endpoint) {
   const url = new URL(endpoint);
@@ -41,12 +46,13 @@ export function retryDelayMs(failure, attempt, retryMs, remainingMs, random = Ma
 
 export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), ports = new Set([80, 443]),
   proxyEnv = process.env, openTimeoutMs = 10_000, attempts = 12, retryMs = 1000, connectWindowMs = 90_000, maxSessions = 24, maxQueued = 32, queueWaitMs = 20_000,
-  idleEvictMs = 90_000, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
+  idleEvictMs = 90_000, halfCloseIdleMs = HALF_CLOSE_IDLE_MS, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
   endpoint = validateEndpoint(endpoint);
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('Secret must have at least 32 characters');
   // Reuse authenticated HTTPS control sockets for readiness and cancellation.
   const agent = new https.Agent({ proxyEnv, keepAlive: true, maxSockets: 32, maxFreeSockets: 4 });
   if (!Number.isFinite(idleEvictMs) || idleEvictMs < 0) throw new Error('Invalid idle eviction threshold');
+  if (!Number.isFinite(halfCloseIdleMs) || halfCloseIdleMs < 0) throw new Error('Invalid half-close idle threshold');
   const queue = new SessionQueue({limit:maxSessions,maxPending:maxQueued,waitMs:queueWaitMs});
   // HTTPS prevents classifying keep-alive, HTTP/2, and application WebSockets.
   // Never evict normally. Under admission pressure only, preempt the oldest
@@ -168,7 +174,7 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
       try {
         if(signal?.aborted)throw Object.assign(new Error('Cancelled'),{failure:'QUEUE_CANCELLED',retryable:false});
         consume(8192); // Charge every attempt, including failed authentication/TLS.
-        const headers = { Authorization: `Bearer ${secret}` };
+        const headers = { Authorization: `Bearer ${secret}`, 'X-Tunnel-Half-Close': '1' };
         if (earlyTarget) headers['X-Tunnel-Open'] = sealFastOpen(secret, host, port);
         ws = new WebSocket(endpoint, { headers, ca,
           agent, followRedirects: false, rejectUnauthorized: true, minVersion: 'TLSv1.2', handshakeTimeout: timeoutMs, perMessageDeflate: false, maxPayload: 65536 });
@@ -187,7 +193,9 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
           if (verdict.ready !== true) { fail({retryable:false,failure:failures.has(verdict.failure)?verdict.failure:'INTERNAL_ERROR',id:verdict.id}); return; }
           settled = true; clearTimeout(timer); pending.delete(ws); active.add(ws);
           if(/^[a-f0-9-]{36}$/.test(verdict.id||''))sessionIds.set(ws,verdict.id);
-          const stream = createWebSocketStream(ws, { highWaterMark: 65536 });
+          // Old relays omit halfClose: keep reading after a local half-close
+          // instead of closing the WebSocket (no EOF reaches the origin then).
+          const stream = createTunnelStream(ws, { halfClose: verdict.halfClose === true, legacyFinal: 'keep', highWaterMark: 65536 });
           stream.on('error', () => {});
           ws.once('close', code => {active.delete(ws);if(!signal?.aborted && code!==1000 && code!==1005)report(diagnostic,'connected',{failure:'REMOTE_SOCKET_CLOSED'},/^[a-f0-9-]{36}$/.test(verdict.id||'')?verdict.id:id,started);});
           resolve({ ws, stream });
@@ -277,8 +285,23 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
       const { ws, stream } = remote;
       if (socket.destroyed) { endTunnel(ws); return; }
       const finish = () => { socket.destroy(); endTunnel(ws); };
-      stream.on('error', finish); stream.on('close', finish); socket.on('error', finish);socket.on('end',()=>endTunnel(ws)); socket.on('close', () => endTunnel(ws));
-      const up = meter(bytes => consume(bytes + 64), () => touch(ws)), down = meter(bytes => consume(bytes + 64), () => touch(ws));
+      // TCP half-open: a local FIN ends only the upstream direction (pipe ->
+      // EOF frame); the downstream keeps flowing until the remote side ends.
+      // A clean remote end reaches the socket through the pipe (socket.end()).
+      // Only an abrupt tunnel close (no EOF) tears the local socket down.
+      stream.on('error', finish); stream.on('close', () => { if (!stream.readableEnded) finish(); });
+      socket.on('error', finish); socket.on('close', () => { clearTimeout(halfCloseTimer); endTunnel(ws); });
+      // Browsers rarely half-close: a FIN usually means "done". Keep reading
+      // while the downstream is active, but cancel the tunnel (freeing the
+      // remote slot via DELETE) once it stays idle for halfCloseIdleMs.
+      let lastDownAt = performance.now(), halfCloseTimer;
+      const watchHalfClosed = () => {
+        const idle = performance.now() - lastDownAt;
+        if (idle >= halfCloseIdleMs) { finish(); return; }
+        halfCloseTimer = setTimeout(watchHalfClosed, Math.max(1, Math.ceil(halfCloseIdleMs - idle))); halfCloseTimer.unref();
+      };
+      socket.once('end', () => { if (!socket.destroyed && !stream.readableEnded) { lastDownAt = performance.now(); watchHalfClosed(); } });
+      const up = meter(bytes => consume(bytes + 64), () => touch(ws)), down = meter(bytes => consume(bytes + 64), () => { lastDownAt = performance.now(); touch(ws); });
       up.on('error', finish); down.on('error', finish);
       if (head.length) consume(head.length + 64);
       established = true;

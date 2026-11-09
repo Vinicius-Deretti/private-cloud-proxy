@@ -2,10 +2,10 @@ import net from 'node:net';
 
 // All candidates have already passed the DNS policy. This lookup is a pinned
 // snapshot: Node's family/address selection must never resolve the name again.
-export function connectPinned(addresses, port) {
+export function connectPinned(addresses, port, { allowHalfOpen = false } = {}) {
   if (!Array.isArray(addresses) || !addresses.length || addresses.some(address=>!net.isIP(address))) throw new Error('Invalid resolved addresses');
   const socket = net.createConnection({
-    host: 'validated.invalid', port, autoSelectFamily: true,
+    host: 'validated.invalid', port, autoSelectFamily: true, allowHalfOpen,
     lookup(_host, options, callback) {
       const rows=addresses.map(address=>({address,family:net.isIP(address)}));
       if (options.all) callback(null, rows);

@@ -2,7 +2,8 @@ import http from 'node:http';
 import { connectPinned } from './connect.mjs';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { WebSocketServer, WebSocket, createWebSocketStream } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
+import { createTunnelStream, HALF_CLOSE_HEADER } from './tunnel-stream.mjs';
 import { createCachedPublicResolver, target } from './policy.mjs';
 import { Budget, meter } from './budget.mjs';
 import { report as emit } from './diagnostics.mjs';
@@ -16,7 +17,7 @@ export const DEFAULT_RELAY_TIMEOUTS = Object.freeze({ idleMs: 120_000, lifetimeM
 export function createRelay({ secret, server = http.createServer(), resolve = createCachedPublicResolver(), connect = connectPinned,
   ports = new Set([80, 443]), maxSessions = 32, maxBytes = 1024 * 1024 * 1024,
   processBytes = 4 * 1024 * 1024 * 1024, idleMs = DEFAULT_RELAY_TIMEOUTS.idleMs, lifetimeMs = DEFAULT_RELAY_TIMEOUTS.lifetimeMs,
-  connectMs = 10_000, dailySessions = 2000, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
+  connectMs = 10_000, dailySessions = 2000, halfClose = true, diagnostic = event => console.error(JSON.stringify(event)) } = {}) {
   if (typeof secret !== 'string' || secret.length < 32) throw new Error('TUNNEL_TOKEN must have at least 32 characters');
   const expected = Buffer.from(`Bearer ${secret}`);
   const budget = new Budget({ limit: processBytes });
@@ -71,6 +72,9 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
     if (day !== today) { day = today; count = 0; }
     const trafficExhausted=budget.limit-budget.used<8192;
     if (connections.size >= maxSessions || count >= dailySessions || trafficExhausted) { const event=report('limit', {failure:trafficExhausted ? 'TRAFFIC_LIMIT' : count >= dailySessions ? 'SESSION_QUOTA' : 'SESSION_LIMIT'}); return reject(socket, '429 Too Many Requests', event.failure, event.id); }
+    // Half-close is used only when this client asked for it (old clients keep
+    // the previous close-on-end framing).
+    const sessionHalfClose = halfClose && req.headers[HALF_CLOSE_HEADER] === '1';
     wss.handleUpgrade(req, socket, head, ws => {
       connections.add(ws); count++;
       let upstream, stream, idle, lastActivityAt = 0, total = 0, finished = false, denied = false;
@@ -123,7 +127,7 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
           const addresses = Array.isArray(resolved) ? resolved : [resolved];
           // Only the validated snapshot reaches the socket's custom lookup.
           stage = 'tcp';
-          upstream = connect(addresses, port);
+          upstream = connect(addresses, port, { allowHalfOpen: sessionHalfClose });
           upstream.on('connectionAttemptFailed', (_address, _port, _family, error) => report('tcp', error));
           upstream.on('connectionAttemptTimeout', () => report('tcp_timeout', {code:'ETIMEDOUT'}));
           upstream.once('error', error => { const event=report(stage, error.errors?.at(-1) || error); if (stage === 'tcp') deny(event); else finish(); });
@@ -131,8 +135,8 @@ export function createRelay({ secret, server = http.createServer(), resolve = cr
             if (finished || denied) return;
             clearTimeout(timers[0]);
             stage = 'connected';
-            ws.send(JSON.stringify({ ready: true, id }));
-            stream = createWebSocketStream(ws, { highWaterMark: 65536 });
+            ws.send(JSON.stringify(sessionHalfClose ? { ready: true, id, halfClose: true } : { ready: true, id }));
+            stream = createTunnelStream(ws, { halfClose: sessionHalfClose, legacyFinal: 'close', highWaterMark: 65536 });
             const consume = bytes => {
               try {
                 if ((total += bytes) > maxBytes) throw new Error('Session limit');

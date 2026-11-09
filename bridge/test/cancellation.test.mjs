@@ -11,7 +11,8 @@ const control=(f,id,authorized=true)=>new Promise((resolve,reject)=>{
  const req=https.request({hostname:'localhost',port:f.relayPort,path:'/tunnel/'+id,method:'DELETE',ca:fs.readFileSync(`${f.dir}/ca.pem`),headers:authorized?{Authorization:'Bearer '+SECRET}:{}},res=>{res.resume();res.on('end',()=>resolve(res.statusCode));});req.on('error',reject);req.end();
 });
 for(const mode of ['reset','fin'])test(`browser ${mode} cancellation frees a remote slot even when the WebSocket reader is paused`,async()=>{
- const f=await fixture({relayOptions:{maxSessions:1},clientOptions:{maxSessions:1}});let transport,socket;
+ // A local FIN is a half-close: the tunnel is cancelled once the downstream stays idle for halfCloseIdleMs.
+ const f=await fixture({relayOptions:{maxSessions:1},clientOptions:{maxSessions:1,halfCloseIdleMs:100}});let transport,socket;
  f.relay.server.on('upgrade',(_req,peer)=>{transport=peer;});
  try{
   socket=net.connect(f.clientPort,'127.0.0.1');socket.on('error',()=>{});await once(socket,'connect');
@@ -35,7 +36,7 @@ test('session cancellation requires authentication, validates UUID and is idempo
 });
 
 test('unsupported cancellation endpoint falls back without leaking client slots',async()=>{
- const f=await fixture({clientOptions:{maxSessions:1}});let socket,deletes=0;
+ const f=await fixture({clientOptions:{maxSessions:1,halfCloseIdleMs:100}});let socket,deletes=0;
  const handlers=f.relay.server.listeners('request');f.relay.server.removeAllListeners('request');
  f.relay.server.on('request',(req,res)=>{if(req.method==='DELETE'){deletes++;res.writeHead(404);res.end();return;}for(const handler of handlers)handler(req,res);});
  try{
