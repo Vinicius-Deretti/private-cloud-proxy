@@ -45,6 +45,18 @@ function removeHopHeaders(headers) {
 //   with a short backoff, so a mistyped domain fails fast.
 // - Definitive: AUTH_FAILED, DNS_REJECTED/policy, TRAFFIC_LIMIT, TLS/cert
 //   errors, TCP_CONNECTION_REFUSED, NXDOMAIN, and anything after data flowed.
+// Traffic accounting (never undercount real traffic; see docs/PERFORMANCE.md):
+// - RELAY_CONNECTION_BYTES per new TCP+TLS connection to the relay. Reserved
+//   before connecting (so no byte can leave uncounted at the quota edge) and
+//   refunded only when TCP to the relay provably never connected (failure
+//   before TCP, or a control request that reused a keep-alive socket). Covers
+//   the TLS handshake (measured ~5.0 KB full, ~3.6 KB resumed) plus the
+//   upgrade/HTTP headers.
+// - CONTROL_REQUEST_BYTES per control request (/usage, DELETE), which may
+//   reuse a keep-alive connection; response bodies are also metered.
+// - Tunnel payload: every chunk metered, +64 bytes framing allowance.
+export const RELAY_CONNECTION_BYTES = 8192;
+export const CONTROL_REQUEST_BYTES = 2048;
 export const DESTINATION_RETRIES = 2;
 export const DESTINATION_RETRY_MS = 250;
 const TRANSIENT_DESTINATION = new Set(['DNS_FAILED', 'TCP_CONNECT_TIMEOUT', 'NETWORK_UNREACHABLE']);
@@ -98,12 +110,16 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
     const id=sessionIds.get(ws);
     if(!id)return Promise.resolve();
     const cancellation=new Promise(resolve=>{
-      let request,finished=false;
-      const done=(error)=>{if(finished)return;finished=true;clearTimeout(timer);if(error)request?.destroy();resolve();};
+      let request,finished=false,settle=()=>{};
+      const done=(error)=>{if(finished)return;finished=true;clearTimeout(timer);if(error)request?.destroy();settle();resolve();};
       const timer=setTimeout(()=>done(new Error('Cancellation deadline')),2000);
       try{
         const url=new URL(endpoint);url.protocol='https:';url.pathname='/tunnel/'+id;
-        request=https.request(url,{method:'DELETE',agent,ca,rejectUnauthorized:true,minVersion:'TLSv1.2',headers:{Authorization:'Bearer '+secret}},res=>{
+        // Without budget the DELETE is skipped (never send uncounted bytes);
+        // the WebSocket close already ends the remote session.
+        consume(CONTROL_REQUEST_BYTES);
+        const connection=reserveConnection();settle=connection.settle;
+        request=https.request(url,{method:'DELETE',agent,ca,onTcpConnect:connection.connected,rejectUnauthorized:true,minVersion:'TLSv1.2',headers:{Authorization:'Bearer '+secret}},res=>{
           // Normal 204 replies can reuse the authenticated HTTPS connection.
           // A malformed/never-ending response remains bounded by the deadline.
           let size=0;
@@ -130,6 +146,16 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
   }
   let stopped = false,remoteQuotaExhausted=false,remoteFastOpen=false;
   const probes=new Set();
+  // Reserve a relay connection's handshake allowance up front (throws when the
+  // budget cannot cover it); settle() refunds it only if TCP never connected.
+  function reserveConnection() {
+    consume(RELAY_CONNECTION_BYTES);
+    let connected=false,settled=false;
+    return {
+      connected(){connected=true;},
+      settle(){if(settled)return;settled=true;if(!connected)budget.refund?.(RELAY_CONNECTION_BYTES);}
+    };
+  }
   function consume(bytes) {
     try { budget.consume(bytes); } catch {
       report(diagnostic, 'local_traffic', {failure:'TRAFFIC_LIMIT'}, crypto.randomUUID(), performance.now());
@@ -138,18 +164,19 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
   }
   async function checkRelay({timeoutMs=90000}={}) {
     if(stopped || !Number.isFinite(timeoutMs) || timeoutMs<=0 || timeoutMs>90000)throw new Error('Invalid readiness state');
-    consume(8192);
+    consume(CONTROL_REQUEST_BYTES);
+    const connection=reserveConnection();
     return new Promise((resolve,reject)=>{
       let request,finished=false;const started=performance.now();
       const done=(error,value)=>{
-        if(finished)return;finished=true;clearTimeout(timer);probes.delete(request);if(error)request?.destroy();
+        if(finished)return;finished=true;clearTimeout(timer);probes.delete(request);if(error)request?.destroy();connection.settle();
         if(error)reject(Object.assign(new Error('Relay unavailable'),{failure:error.failure||'WSS_CONNECTION_FAILED',code:error.code,source:error.source}));
         else resolve(value);
       };
       const timer=setTimeout(()=>done({code:'ETIMEDOUT'}),timeoutMs);
       try{
         const url=new URL(endpoint);url.protocol='https:';url.pathname='/usage';
-        request=https.get(url,{agent,ca,rejectUnauthorized:true,minVersion:'TLSv1.2',headers:{Authorization:'Bearer '+secret}},res=>{
+        request=https.get(url,{agent,ca,onTcpConnect:connection.connected,rejectUnauthorized:true,minVersion:'TLSv1.2',headers:{Authorization:'Bearer '+secret}},res=>{
           if(res.statusCode!==200){res.resume();done({failure:res.statusCode===401?'AUTH_FAILED':'WSS_CONNECTION_FAILED'});return;}
           let body='',bytes=0;
           res.on('data',chunk=>{
@@ -176,12 +203,12 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
   }
   function onceTunnel(host, port, timeoutMs, signal) {
     return new Promise((resolve, reject) => {
-      let ws, settled = false;
+      let ws, settled = false, connection;
       const earlyTarget = remoteFastOpen;
       const id=crypto.randomUUID(), started=performance.now();
       const fail = cause => {
         if (!settled) {
-          settled = true; ws?.terminate();
+          settled = true; ws?.terminate(); connection?.settle();
           const event = cause?.failure === 'QUEUE_CANCELLED' ? {failure:'QUEUE_CANCELLED',id} : report(diagnostic, 'wss', cause, /^[a-f0-9-]{36}$/.test(cause?.id || '') ? cause.id : id, started);
           const error = new Error('Encrypted tunnel unavailable');
           error.failure=event.failure;error.id=event.id;
@@ -192,10 +219,12 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
       };
       try {
         if(signal?.aborted)throw Object.assign(new Error('Cancelled'),{failure:'QUEUE_CANCELLED',retryable:false});
-        consume(8192); // Charge every attempt, including failed authentication/TLS.
+        // Reserved for every attempt; refunded only if TCP to the relay never
+        // connected. Failed auth/TLS/cold-start replies after TCP stay charged.
+        connection = reserveConnection();
         const headers = { Authorization: `Bearer ${secret}`, 'X-Tunnel-Half-Close': '1' };
         if (earlyTarget) headers['X-Tunnel-Open'] = sealFastOpen(secret, host, port);
-        ws = new WebSocket(endpoint, { headers, ca,
+        ws = new WebSocket(endpoint, { headers, ca, onTcpConnect: connection.connected,
           agent, followRedirects: false, rejectUnauthorized: true, minVersion: 'TLSv1.2', handshakeTimeout: timeoutMs, perMessageDeflate: false, maxPayload: 65536 });
       } catch (error) { fail(error); return; }
       pending.add(ws);
@@ -231,7 +260,7 @@ export function createLocalProxy({ endpoint, secret, ca, budget = new Budget(), 
   async function tunnel(host, port, signal) {
     target(host, port, ports);
     const traffic = () => {
-      if(budget.used + 8192 <= budget.limit)return false;
+      if(budget.used + RELAY_CONNECTION_BYTES <= budget.limit)return false;
       report(diagnostic,'local_limit',{failure:'TRAFFIC_LIMIT'},crypto.randomUUID(),performance.now());return true;
     };
     if(stopped || remoteQuotaExhausted || traffic())throw new Error('Traffic unavailable');

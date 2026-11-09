@@ -41,9 +41,16 @@ export class RelayAgent extends https.Agent {
         done(null, preferFamily(address, this.families.get(host)));
       });
     } } : options;
+    const onTcpConnect = options.onTcpConnect;
     const watch = socket => {
       if (!socket || socket.__relayWatched) return socket;
       socket.__relayWatched = true;
+      // Accounting hook: runs once when TCP to the relay (or the configured
+      // proxy) is up; if it throws (budget), the connection is aborted.
+      if (typeof onTcpConnect === 'function') {
+        const fire = () => { try { onTcpConnect(); } catch (error) { socket.destroy(error); } };
+        if (!socket.connecting && !socket.destroyed && socket.remoteAddress) fire(); else socket.once('connect', fire);
+      }
       socket.once('secureConnect', () => {
         if (socket.isSessionReused?.()) this.tlsStats.resumed++; else this.tlsStats.full++;
         const family = socket.remoteFamily === 'IPv6' ? 6 : socket.remoteFamily === 'IPv4' ? 4 : undefined;

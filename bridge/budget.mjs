@@ -77,6 +77,14 @@ export class Budget {
     }
     this.used = next;
   }
+  // Reverse an up-front estimate for bytes that provably never left (e.g. a
+  // relay connection reserved but never TCP-connected). Only the in-memory
+  // count decreases; the persisted watermark never goes down, so a restart
+  // stays conservative.
+  refund(bytes) {
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.used) throw new Error('Invalid refund');
+    this.used -= bytes;
+  }
 }
 
 export function meter(consume, activity = () => {}) {
